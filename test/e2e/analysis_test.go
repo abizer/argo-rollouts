@@ -340,6 +340,99 @@ spec:
 		ExpectPreviewRevision("2")
 }
 
+// TestBlueGreenScaleUpPreviewCheckPointReset verifies that a pod template change which lands
+// after scaleUpPreviewCheckPoint was set for the previous revision resets the checkpoint, so the
+// new revision runs its own prePromotionAnalysis at previewReplicaCount instead of scaling
+// straight to full replicas and cutting over without analysis.
+// https://github.com/argoproj/argo-rollouts/issues/4728
+func (s *AnalysisSuite) TestBlueGreenScaleUpPreviewCheckPointReset() {
+	s.Given().
+		RolloutObjects(newService("checkpoint-reset-active", "checkpoint-reset")).
+		RolloutObjects(newService("checkpoint-reset-preview", "checkpoint-reset")).
+		RolloutObjects(`
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: checkpoint-reset
+spec:
+  replicas: 3
+  strategy:
+    blueGreen:
+      activeService: checkpoint-reset-active
+      previewService: checkpoint-reset-preview
+      previewReplicaCount: 1
+      autoPromotionEnabled: false
+      prePromotionAnalysis:
+        templates:
+        - templateName: sleep-job
+        args:
+        - name: duration
+          value: "5"
+  selector:
+    matchLabels:
+      app: checkpoint-reset
+  template:
+    metadata:
+      labels:
+        app: checkpoint-reset
+    spec:
+      containers:
+      - name: checkpoint-reset
+        image: nginx:1.19-alpine
+        # delay readiness so the post-checkpoint scale-up window stays open long enough to
+        # deterministically inject a template change before the active service cuts over
+        readinessProbe:
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          httpGet:
+            path: /
+            port: 80
+        resources:
+          requests:
+            memory: 16Mi
+            cpu: 5m
+`).
+		When().
+		ApplyManifests().
+		WaitForRolloutStatus("Healthy").
+		Then().
+		ExpectAnalysisRunCount(0).
+		When().
+		UpdateSpec(). // update to revision 2
+		WaitForRolloutStatus("Paused"). // prePromotionAnalysis passed, waiting for manual promotion
+		Then().
+		ExpectAnalysisRunCount(1).
+		ExpectActiveRevision("1").
+		ExpectPreviewRevision("2").
+		ExpectRevisionPodCount("2", 1).
+		When().
+		PromoteRollout().
+		// the preview RS is scaled from previewReplicaCount to spec.replicas only after
+		// status.blueGreen.scaleUpPreviewCheckPoint=true has been persisted, so waiting for the
+		// scale-up guarantees the checkpoint is set before we change the template
+		WaitForRevisionPodCount("2", 3).
+		// change the template while revision 2's new pods are still held un-ready by the
+		// readiness probe delay (i.e. before the active service cutover)
+		UpdateSpec(). // update to revision 3
+		WaitForRolloutStatus("Paused").
+		Then().
+		// revision 3 must run its own prePromotionAnalysis at previewReplicaCount before any
+		// cutover. Without the checkpoint reset, the stale checkpoint scales revision 3 straight
+		// to full replicas, skipPrePromotionAnalysisRun skips the analysis entirely, and the
+		// rollout cuts over without pausing (this WaitForRolloutStatus times out)
+		ExpectAnalysisRunCount(2).
+		ExpectActiveRevision("1").
+		ExpectPreviewRevision("3").
+		ExpectRevisionPodCount("3", 1).
+		When().
+		PromoteRollout().
+		WaitForRolloutStatus("Healthy").
+		Then().
+		ExpectAnalysisRunCount(2).
+		ExpectActiveRevision("3").
+		ExpectStableRevision("3")
+}
+
 func (s *AnalysisSuite) TestBlueGreenPostPromotionFail() {
 	s.Given().
 		RolloutObjects(newService("post-promotion-fail-active", "post-promotion-fail")).
